@@ -1,0 +1,335 @@
+# ============================================================
+# ORGANISATION LEVEL CI/CD PIPELINE
+#
+# This is how real companies structure their pipelines.
+# Every stage has a purpose. If any stage FAILS → pipeline stops.
+# Code never reaches production unless ALL checks pass.
+#
+# PIPELINE FLOW:
+#
+#  [1] CODE QUALITY    [2] SECURITY SCAN   [3] UNIT TESTS
+#       (SonarCloud)       (Bandit+Safety)     (pytest)
+#           |                   |                  |
+#           └───────────────────┴──────────────────┘
+#                               |
+#                        ALL 3 PASSED?
+#                               |
+#                    [4] BUILD DOCKER IMAGE
+#                               |
+#                  [5] SCAN CONTAINER (Trivy)
+#                               |
+#                  [6] PUSH IMAGE TO ACR
+#                               |
+#                  [7] DEPLOY TO DEV (auto)
+#                               |
+#              [8] DEPLOY TO PRODUCTION (manual approval)
+#
+# ============================================================
+
+name: CI/CD Pipeline - Notes API
+
+# Runs when code is pushed to master OR a Pull Request is opened
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+# These are shared values used across all jobs
+env:
+  IMAGE_NAME: notes-api
+  RESOURCE_GROUP: rg-notes-api
+  CONTAINER_APP_NAME: notes-api
+
+# ============================================================
+# JOB 1: CODE QUALITY — SonarCloud
+#
+# WHY: SonarCloud reads every line of your code and tells you:
+#   - Is there a bug hiding here?
+#   - Is this a security vulnerability?
+#   - Is this code too complex / hard to maintain?
+# Companies use this to maintain code quality over time.
+# Think of it as a strict code reviewer that never misses anything.
+# ============================================================
+jobs:
+  code-quality:
+    name: Code Quality — SonarCloud
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # SonarCloud needs full git history for better analysis
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # auto-provided by GitHub
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}    # you create this in SonarCloud
+
+  # ============================================================
+  # JOB 2: SECURITY SCAN — Bandit + Safety
+  #
+  # WHY: Two different security tools that check different things:
+  #
+  # BANDIT = scans your Python CODE for security issues
+  #   Example: Are you using MD5 for passwords? (weak — bandit catches it)
+  #   Example: Are you running shell commands unsafely? (injection risk)
+  #
+  # SAFETY = scans your DEPENDENCIES (requirements.txt) for known CVEs
+  #   Example: Flask 2.0.0 has a known vulnerability → safety warns you
+  #   CVE = Common Vulnerabilities and Exposures (public security bug database)
+  #
+  # This runs PARALLEL with code-quality (saves time)
+  # ============================================================
+  security-scan:
+    name: Security Scan — Bandit + Safety
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install security tools
+        run: pip install bandit safety
+
+      - name: Bandit — scan code for security issues
+        run: |
+          bandit -r . \
+            --exclude ./venv \
+            --format json \
+            --output bandit-report.json || true
+          # "|| true" means: even if bandit finds issues, don't fail yet
+          # We upload the report so you can see issues, then decide
+          cat bandit-report.json
+
+      - name: Safety — scan dependencies for known CVEs
+        run: |
+          pip install -r requirements.txt
+          safety check --full-report
+
+      # Save the bandit report so you can download and read it
+      - name: Upload Bandit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-security-report
+          path: bandit-report.json
+
+  # ============================================================
+  # JOB 3: UNIT TESTS — pytest
+  #
+  # WHY: Tests prove your code actually works correctly.
+  # Before deploying, we run all tests automatically.
+  # If a test fails → the pipeline stops → broken code never reaches Azure.
+  #
+  # --cov = measure code coverage (what % of code is tested)
+  # We generate coverage.xml → SonarCloud reads it to show coverage score
+  # ============================================================
+  unit-tests:
+    name: Unit Tests — pytest
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests with coverage
+        run: |
+          pytest test_app.py \
+            --cov=app \
+            --cov-report=xml \
+            --cov-report=term \
+            -v
+          # -v = verbose (show each test name and pass/fail)
+          # --cov-report=term = show coverage % in terminal
+          # --cov-report=xml = save coverage.xml for SonarCloud
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  # ============================================================
+  # JOB 4: BUILD DOCKER IMAGE
+  #
+  # WHY: This runs ONLY after jobs 1, 2, 3 all pass.
+  # "needs" keyword = wait for these jobs first.
+  # No point building if code has bugs or security issues.
+  #
+  # We tag the image with the git commit SHA.
+  # WHY SHA? Every commit has a unique ID (abc1234...).
+  # So every image is unique and traceable back to the exact code.
+  # If something goes wrong in prod → you know exactly which commit caused it.
+  # ============================================================
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: [code-quality, security-scan, unit-tests]  # all 3 must pass first
+
+    # Only build and deploy when pushing to master (not on PRs — just test PRs)
+    if: github.ref == 'refs/heads/master'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login to Azure Container Registry
+        run: az acr login --name ${{ secrets.ACR_LOGIN_SERVER }}
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            -t ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest \
+            .
+
+  # ============================================================
+  # JOB 5: CONTAINER SECURITY SCAN — Trivy
+  #
+  # WHY: Your code might be fine but the BASE IMAGE (python:3.12-slim)
+  # could have vulnerabilities. Trivy scans the built image for:
+  #   - OS-level vulnerabilities (inside the container's Linux)
+  #   - Package vulnerabilities (your pip packages inside the image)
+  #
+  # CRITICAL or HIGH severity = pipeline fails (too risky for production)
+  # MEDIUM or LOW = warning only (we log it but continue)
+  # ============================================================
+  container-scan:
+    name: Container Security Scan — Trivy
+    runs-on: ubuntu-latest
+    needs: [build]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login to ACR
+        run: az acr login --name ${{ secrets.ACR_LOGIN_SERVER }}
+
+      - name: Pull built image for scanning
+        run: docker pull ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Trivy — scan container image for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: table
+          exit-code: '1'           # fail pipeline if vulnerabilities found
+          severity: 'CRITICAL,HIGH' # only fail for serious ones
+
+      - name: Push image to ACR (only after scan passes)
+        run: |
+          docker push ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest
+
+  # ============================================================
+  # JOB 6: DEPLOY TO DEV — Automatic
+  #
+  # WHY auto-deploy to dev?
+  # Dev environment = safe to break. Every push auto-deploys here.
+  # Developers can see their changes live in dev within minutes.
+  # No manual steps needed for dev.
+  # ============================================================
+  deploy-dev:
+    name: Deploy to Dev
+    runs-on: ubuntu-latest
+    needs: [container-scan]
+    environment: dev  # links to GitHub Environment "dev"
+
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy to Dev Container App
+        run: |
+          az containerapp update \
+            --name ${{ env.CONTAINER_APP_NAME }}-dev \
+            --resource-group ${{ env.RESOURCE_GROUP }}-dev \
+            --image ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Show Dev URL
+        run: |
+          echo "Dev URL:"
+          az containerapp show \
+            --name ${{ env.CONTAINER_APP_NAME }}-dev \
+            --resource-group ${{ env.RESOURCE_GROUP }}-dev \
+            --query properties.configuration.ingress.fqdn \
+            --output tsv
+
+  # ============================================================
+  # JOB 7: DEPLOY TO PRODUCTION — Manual Approval Required
+  #
+  # WHY manual approval for production?
+  # Production = real users. You NEVER auto-deploy to prod.
+  # Someone (tech lead / DevOps engineer) must review and click APPROVE.
+  # This is the industry standard. Banks require 2-person approval.
+  #
+  # HOW IT WORKS:
+  # Pipeline pauses here → sends notification to approvers
+  # Approver goes to GitHub → reviews changes → clicks Approve
+  # Only then does the deploy to prod run
+  #
+  # In GitHub: Settings → Environments → production → add Required Reviewers
+  # ============================================================
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [deploy-dev]
+    environment: production  # GitHub pauses here and waits for manual approval
+
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy to Production Container App
+        run: |
+          az containerapp update \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Show Production URL
+        run: |
+          echo "Production URL:"
+          az containerapp show \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query properties.configuration.ingress.fqdn \
+            --output tsv
