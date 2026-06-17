@@ -1,0 +1,15 @@
+# .gitignore — tells Git which files to IGNORE (not push to GitHub)
+
+# Virtual environment — no need to push, anyone can recreate with pip install
+venv/
+
+# Python compiled files — auto-generated, not needed
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment variables file — contains secrets like passwords, NEVER push this
+.env
+
+# VS Code settings — your personal editor settings, not part of the app
+.vscode/
