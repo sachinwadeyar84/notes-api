@@ -1,0 +1,250 @@
+# ============================================================
+# terraform.yml — Infrastructure Pipeline
+#
+# This pipeline ONLY runs when Terraform files change.
+# It is completely separate from the app deploy pipeline.
+#
+# WHY separate pipeline for infrastructure?
+# - Infrastructure changes are more dangerous than app changes
+# - A wrong terraform apply can delete your database!
+# - Needs different approvals (senior DevOps engineer must approve)
+# - App team and infra team work independently
+#
+# PIPELINE FLOW:
+#
+#  terraform/ files changed
+#           │
+#    [1] FORMAT CHECK     ← is the code properly formatted?
+#           │
+#    [2] VALIDATE         ← is the syntax correct?
+#           │
+#    [3] PLAN             ← what WILL change? (safe, no changes made)
+#           │             ← on Pull Request: posts plan as a comment
+#           │
+#    [4] APPLY            ← actually create/update/delete resources
+#                         ← ONLY runs on push to master
+#                         ← requires manual approval in GitHub
+#
+# ============================================================
+
+name: Terraform Infrastructure Pipeline
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'terraform/**'   # only runs when files inside terraform/ folder change
+  pull_request:
+    branches: [master]
+    paths:
+      - 'terraform/**'
+  workflow_dispatch:     # allows you to run this manually from GitHub UI
+                         # useful when you want to apply without changing files
+
+# These environment variables are read automatically by Terraform
+# to authenticate with Azure — no need to pass them explicitly
+env:
+  ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+  ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+  ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+  # TF_LOG: INFO  # uncomment this line if you need detailed Terraform logs for debugging
+
+jobs:
+
+  # ============================================================
+  # JOB 1: FORMAT CHECK
+  #
+  # WHY: Terraform has a standard code style (like Python has PEP8).
+  # terraform fmt checks if your code follows that style.
+  # In teams, everyone must format code the same way.
+  # If not formatted correctly → pipeline fails immediately.
+  # This keeps code clean and readable for everyone.
+  # ============================================================
+  terraform-fmt:
+    name: Format Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"  # pin version — same as your local machine
+
+      - name: Terraform Format Check
+        run: |
+          cd terraform
+          terraform fmt -check -recursive
+          # -check = don't fix, just check and fail if not formatted
+          # -recursive = check all .tf files in all subfolders
+
+  # ============================================================
+  # JOB 2: VALIDATE
+  #
+  # WHY: terraform validate checks if your .tf files have correct syntax.
+  # It catches errors like:
+  #   - missing required fields
+  #   - wrong resource names
+  #   - invalid values
+  # This runs WITHOUT connecting to Azure — purely a local check.
+  # Fast and cheap to run.
+  # ============================================================
+  terraform-validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    needs: [terraform-fmt]  # only validate if format check passed
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Terraform Init
+        run: |
+          cd terraform
+          terraform init -backend=false
+          # -backend=false = skip connecting to remote state
+          # We just want to validate syntax, no need for state
+
+      - name: Terraform Validate
+        run: |
+          cd terraform
+          terraform validate
+          # Checks all .tf files for syntax errors
+
+  # ============================================================
+  # JOB 3: PLAN
+  #
+  # WHY: terraform plan is the most important step.
+  # It connects to Azure, reads current state, and tells you:
+  #   - What will be CREATED  (+)
+  #   - What will be CHANGED  (~)
+  #   - What will be DELETED  (-)
+  #
+  # On Pull Requests: the plan is posted as a comment on the PR
+  # So the reviewer can see EXACTLY what infrastructure will change
+  # before approving the PR. This prevents accidental deletions!
+  # ============================================================
+  terraform-plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    needs: [terraform-validate]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Terraform Init
+        run: |
+          cd terraform
+          terraform init
+          # This time we connect for real — needs ARM_ secrets
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          cd terraform
+          terraform plan -no-color -out=tfplan
+          # -no-color = plain text output (easier to read in GitHub comments)
+          # -out=tfplan = save the plan to a file so apply uses EXACT same plan
+        continue-on-error: true  # show plan even if there are errors
+
+      # Post the plan as a comment on the Pull Request
+      # So reviewer sees what will change BEFORE approving
+      - name: Comment Plan on PR
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          script: |
+            const output = `#### Terraform Plan 📖
+            \`\`\`
+            ${{ steps.plan.outputs.stdout }}
+            \`\`\`
+            *Pushed by: @${{ github.actor }}*`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+      - name: Save Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: terraform/tfplan
+          retention-days: 1  # keep plan for 1 day only (security)
+
+  # ============================================================
+  # JOB 4: APPLY
+  #
+  # WHY manual approval before apply?
+  # terraform apply ACTUALLY changes your Azure infrastructure.
+  # Mistakes here can:
+  #   - Delete your database (and all data!)
+  #   - Remove firewall rules (security risk)
+  #   - Cause downtime for real users
+  #
+  # So we NEVER auto-apply. A senior engineer must:
+  # 1. Review the plan from Job 3
+  # 2. Go to GitHub → Actions → Review pending deployments
+  # 3. Click Approve
+  # THEN apply runs.
+  #
+  # This only runs on push to master (not on PRs)
+  # ============================================================
+  terraform-apply:
+    name: Apply (Requires Approval)
+    runs-on: ubuntu-latest
+    needs: [terraform-plan]
+    environment: infrastructure  # GitHub pauses here for manual approval
+                                 # Set up: Settings → Environments → infrastructure → add yourself as reviewer
+
+    # Only apply when pushing to master — never on pull requests
+    if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Terraform Init
+        run: |
+          cd terraform
+          terraform init
+
+      - name: Download Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: terraform/
+
+      - name: Terraform Apply
+        run: |
+          cd terraform
+          terraform apply -auto-approve tfplan
+          # -auto-approve = don't ask "yes/no" interactively
+          # tfplan = use the EXACT plan from Job 3 (no surprises)
+
+      - name: Show Outputs
+        run: |
+          cd terraform
+          echo "==== Infrastructure Outputs ===="
+          terraform output
+          # Prints all resource URLs and names after apply

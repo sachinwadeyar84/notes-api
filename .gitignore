@@ -13,3 +13,10 @@ __pycache__/
 
 # VS Code settings — your personal editor settings, not part of the app
 .vscode/
+
+# Terraform — contains sensitive values like subscription IDs
+terraform/terraform.tfvars
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
