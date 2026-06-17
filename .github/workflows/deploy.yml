@@ -69,7 +69,7 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}    # you create this in SonarCloud
 
   # ============================================================
-  # JOB 2: SECURITY SCAN — Bandit + Safety
+  # JOB 2: SECURITY SCAN — Bandit + pip-audit
   #
   # WHY: Two different security tools that check different things:
   #
@@ -77,14 +77,17 @@ jobs:
   #   Example: Are you using MD5 for passwords? (weak — bandit catches it)
   #   Example: Are you running shell commands unsafely? (injection risk)
   #
-  # SAFETY = scans your DEPENDENCIES (requirements.txt) for known CVEs
-  #   Example: Flask 2.0.0 has a known vulnerability → safety warns you
+  # PIP-AUDIT = scans your DEPENDENCIES (requirements.txt) for known CVEs
+  #   Example: Flask 2.0.0 has a known vulnerability → pip-audit warns you
   #   CVE = Common Vulnerabilities and Exposures (public security bug database)
+  #   WHY pip-audit instead of safety?
+  #   safety has compatibility bugs with newer Python versions
+  #   pip-audit is maintained by PyPA (official Python Packaging team) — more reliable
   #
   # This runs PARALLEL with code-quality (saves time)
   # ============================================================
   security-scan:
-    name: Security Scan — Bandit + Safety
+    name: Security Scan — Bandit + pip-audit
     runs-on: ubuntu-latest
 
     steps:
@@ -97,7 +100,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install security tools
-        run: pip install bandit safety
+        run: pip install bandit pip-audit
 
       - name: Bandit — scan code for security issues
         run: |
@@ -109,10 +112,13 @@ jobs:
           # We upload the report so you can see issues, then decide
           cat bandit-report.json
 
-      - name: Safety — scan dependencies for known CVEs
+      - name: pip-audit — scan dependencies for known CVEs
         run: |
           pip install -r requirements.txt
-          safety check --full-report
+          pip-audit --requirement requirements.txt
+          # pip-audit checks every package in requirements.txt
+          # against the Python Advisory Database (PyPA)
+          # If any package has a known vulnerability → pipeline fails
 
       # Save the bandit report so you can download and read it
       - name: Upload Bandit report
